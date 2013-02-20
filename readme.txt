@@ -32,5 +32,6 @@ echo 18 > /sys/class/gpio/export
 echo 23 > /sys/class/gpio/export
 echo out > /sys/class/gpio/gpio23/direction
 echo both > /sys/class/gpio/gpio18/edge
+chown pi /sys/class/gpio/gpio23/value
 
 Have fun!
