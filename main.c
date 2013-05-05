@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -68,7 +69,7 @@ static void trigger_process_error(alarm_loop_t loop, alarm_process_t process, vo
     fprintf(stdout, "camera stopped\n");
 }
 
-static void trigger_timeout(alarm_loop_t loop, alarm_timer_t timer, void* data) {
+static void trigger_timeout(alarm_loop_t loop, alarm_timer_t timer, const struct timeval *tv, void* data) {
     struct Trigger* trigger = (struct Trigger*)data;
 
     if (timer == trigger->min_off_timer) {
@@ -92,7 +93,14 @@ static void trigger_timeout(alarm_loop_t loop, alarm_timer_t timer, void* data) 
         }
     }
     if (trigger->process) {
-        fprintf(stdout, "stop camera\n");
+        time_t t;
+        struct tm *tm;
+        char buf[64];
+        t = tv->tv_sec;
+        tm = localtime(&t);
+        strftime(buf, sizeof (buf), "%Y-%m-%d %H:%M:%S", tm);
+
+        fprintf(stdout, "%s stop camera\n", buf);
         alarm_process_signal(loop, trigger->process, SIGINT);
     }
     if (trigger->alarm_fd > -1) {
@@ -107,7 +115,6 @@ static void trigger_timeout(alarm_loop_t loop, alarm_timer_t timer, void* data) 
 
 static void trigger_event(alarm_loop_t loop, alarm_fd_t afd, int fd, void* data) {
     struct Trigger* trigger = (struct Trigger*)data;
-    int start_timer = 0;
     int count;
     char c;
     (void)afd;
@@ -158,7 +165,6 @@ static void trigger_error(alarm_loop_t loop, alarm_fd_t fd, void* data) {
 }
 
 int open_gpio_value(int pin, int flag) {
-    int fd;
     char buf[256];
     int sz = snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/value", pin);
     if (sz > sizeof(buf) -2) {

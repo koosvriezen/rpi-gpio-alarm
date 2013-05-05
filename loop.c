@@ -36,7 +36,6 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/select.h>
-#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -138,14 +137,16 @@ struct AlarmTimer
 {
     struct AlarmLoopAdmin admin;
     struct timeval tv;
+    int msec;
     alarm_timer_callback callback;
     void* data;
 };
 
-static void timer_init(struct AlarmTimer* at, struct timeval tv, alarm_timer_callback cb, void* d)
+static void timer_init(struct AlarmTimer* at, int ms, alarm_timer_callback cb, void* d)
 {
     init_loop_admin(&at->admin, FlagNone);
-    at->tv = tv;
+    at->tv.tv_sec = 0;
+    at->msec = ms;
     at->callback = cb;
     at->data = d;
 }
@@ -188,12 +189,8 @@ static inline int diff_time (const struct timeval* tv1, const struct timeval* tv
 
 alarm_timer_t alarm_loop_add_timer(alarm_loop_t loop, int msec, alarm_timer_callback cb, void* data)
 {
-    struct timeval tv;
-    gettimeofday (&tv, 0L);
-    add_time(&tv, msec);
-
     struct AlarmTimer* at = (struct AlarmTimer*)malloc(sizeof (struct AlarmTimer));;
-    timer_init(at, tv, cb, data);
+    timer_init(at, msec, cb, data);
     array_append(&loop->timers, at);
     return at;
 }
@@ -298,12 +295,19 @@ void alarm_loop_run (alarm_loop_t loop)
             for (i = 0; i < loop->timers.size; ++i) {
                 struct AlarmTimer* timer = (struct AlarmTimer*)loop->timers.data[i];
                 FLAG(timer, FlagProcessing);
-                int dt = diff_time (&timer->tv, &tv);
-                if (TEST(loop, FlagRun) && dt < 2) {
-                    timer->callback(loop, timer, timer->data);
-                    FLAG(timer, FlagMarkDelete);
-                } else if (dt < timout) {
-                    timout = dt;
+                if (!timer->tv.tv_sec) {
+                    timer->tv = tv;
+                    add_time(&timer->tv, timer->msec);
+                    if (timer->msec < timout)
+                        timout = timer->msec;
+                } else {
+                    int dt = diff_time (&timer->tv, &tv);
+                    if (TEST(loop, FlagRun) && dt < 2) {
+                        timer->callback(loop, timer, &tv, timer->data);
+                        FLAG(timer, FlagMarkDelete);
+                    } else if (dt < timout) {
+                        timout = dt;
+                    }
                 }
             }
             for (i = 0; i < loop->timers.size;) {
