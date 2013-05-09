@@ -29,11 +29,13 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/select.h>
 #include <sys/types.h>
@@ -77,7 +79,8 @@ static void array_clear(struct Array *array)
 
 enum AlarmFlags {
     FlagNone=0, FlagRun=1, FlagProcessing=2,
-    FlagMarkDelete=4, FlagFdClosed=8
+    FlagMarkDelete=4, FlagFdClosed=8,
+    FlagPassiveSocket=16
 };
 
 struct AlarmLoopAdmin
@@ -125,7 +128,7 @@ static void fd_init(struct AlarmFileDescriptor* afd, int fd,
     afd->data = d;
 }
 
-static void fd_close(struct AlarmFileDescriptor* afd)
+static void fd_close(alarm_fd_t afd)
 {
     if (TEST(afd, FlagFdClosed) || afd->fd < 0)
         return;
@@ -348,7 +351,7 @@ void alarm_loop_run (alarm_loop_t loop)
                         maxfd = fd;     \
                 }
                 ALARM_ADD_TO_SET(fd->fd, rdset, fd->read_callback)
-                ALARM_ADD_TO_SET(fd->fd, wrset, fd->buffer_size)
+                ALARM_ADD_TO_SET(fd->fd, wrset, fd->buffer)
                 ALARM_ADD_TO_SET(fd->fd, exset, fd->except_callback)
 #undef ALARM_ADD_TO_SET
                 /*fprintf(stderr, " %d", fd->fd);*/
@@ -361,20 +364,26 @@ void alarm_loop_run (alarm_loop_t loop)
             for (i = 0; TEST(loop, FlagRun) && i < loop->fds.size; ++i) {
                 struct AlarmFileDescriptor *fd = (struct AlarmFileDescriptor*)loop->fds.data[i];
                 if (!TEST(fd, FlagMarkDelete) && FD_ISSET(fd->fd, &rdset)) {
-                    char buf[1024];
-                    int nr = read(fd->fd, buf, sizeof (buf)-1);
-                    if (nr > 0) {
-                        buf[nr] = 0;
-                        fd->read_callback(loop, fd, buf, nr, fd->data);
-                    } else if (nr == 0 || !(EAGAIN == errno || EINTR == errno)) {
-                        fd_close(fd);
-                        if (fd->error_callback)
-                            fd->error_callback(loop, fd, fd->data);
+                    if (TEST(fd, FlagPassiveSocket)) {
+                        fd->read_callback(loop, fd, "", 0, fd->data);
+                    } else {
+                        char buf[1024];
+                        int nr = read(fd->fd, buf, sizeof (buf)-1);
+                        if (nr > 0) {
+                            buf[nr] = 0;
+                            fd->read_callback(loop, fd, buf, nr, fd->data);
+                        } else if (nr == 0 || !(EAGAIN == errno || EINTR == errno)) {
+                            fd_close(fd);
+                            if (fd->error_callback)
+                                fd->error_callback(loop, fd, fd->data);
+                        }
                     }
                 }
                 if (TEST(loop, FlagRun) && !TEST(fd, FlagMarkDelete) && FD_ISSET(fd->fd, &wrset)) {
-                    int nr = write(fd->fd, fd->buffer, fd->buffer_size);
-                    if (nr > 0) {
+                    int nr = 0;
+                    if (fd->buffer_size)
+                        nr = write(fd->fd, fd->buffer, fd->buffer_size);
+                    if (!fd->buffer_size || nr > 0) {
                         if (nr == fd->buffer_size) {
                             free(fd->buffer);
                             fd->buffer = NULL;
@@ -563,4 +572,163 @@ void alarm_process_signal(alarm_loop_t loop, alarm_process_t p, int sig)
 {
     if (p->pid > 0)
         kill(-1 * p->pid, sig);
+}
+
+
+struct AlarmSocket
+{
+    struct AlarmLoopAdmin admin;
+    alarm_fd_t socket;
+    int connected;
+    alarm_socket_connected_cb connected_callback;
+    alarm_socket_new_connection_cb new_connection_callback;
+    alarm_socket_read_cb read_callback;
+    alarm_socket_written_cb written_callback;
+    alarm_socket_error_cb error_callback;
+    void* data;
+};
+
+static void socket_init(struct AlarmSocket* so,
+        alarm_socket_connected_cb ccb,
+        alarm_socket_new_connection_cb ncb,
+        alarm_socket_read_cb rcb,
+        alarm_socket_written_cb wcb,
+        alarm_socket_error_cb err,
+        void* d)
+{
+    init_loop_admin(&so->admin, FlagNone);
+    so->socket = NULL;
+    so->connected = 0;
+    so->connected_callback = ccb;
+    so->new_connection_callback = ncb;
+    so->read_callback = rcb;
+    so->written_callback = wcb;
+    so->error_callback = err;
+    so->data = d;
+}
+
+static void socket_written(alarm_loop_t loop, alarm_fd_t afd, void* data)
+{
+    struct AlarmSocket* so = (struct AlarmSocket*)data;
+    if (so->connected_callback && !so->connected) {
+        socklen_t len = sizeof (errno);
+        if (!getsockopt(afd->fd, SOL_SOCKET, SO_ERROR, &errno, &len) && !errno) {
+            so->connected = 1;
+            if (so->connected_callback)
+                so->connected_callback(loop, so, so->data);
+        } else {
+            fd_close(so->socket);
+            so->socket = NULL;
+            if (so->error_callback)
+                so->error_callback(loop, so, so->data);
+        }
+    } else if (so->written_callback) {
+        so->written_callback(loop, so, so->data);
+    }
+}
+
+static void socket_error(alarm_loop_t loop, alarm_fd_t afd, void* data)
+{
+    struct AlarmSocket* so = (struct AlarmSocket*)data;
+    so->socket = NULL;
+    if (so->error_callback)
+        so->error_callback(loop, so, so->data);
+}
+
+static void socket_read(alarm_loop_t loop, alarm_fd_t afd, const char* buffer, int size, void* data)
+{
+    struct AlarmSocket* so = (struct AlarmSocket*)data;
+    if (so->new_connection_callback) {
+        struct sockaddr_in from;
+        socklen_t fromlen = sizeof (from);
+        int fd = accept(so->socket->fd, (struct sockaddr*)&from, &fromlen);
+        if (fd > 0) {
+            fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK | FD_CLOEXEC);
+            struct AlarmSocket *client = (struct AlarmSocket*)malloc(sizeof (struct AlarmSocket));
+            socket_init(client, NULL, NULL, so->read_callback, so->written_callback, so->error_callback, so->data);
+            client->socket = alarm_loop_add_fd(loop, fd, socket_read, socket_written, NULL, socket_error, client);
+            so->new_connection_callback(loop, client, from.sin_addr.s_addr, client->data);
+        } else {
+            perror("accept");
+        }
+    } else if (so->read_callback) {
+        so->read_callback(loop, so, buffer, size, so->data);
+    }
+}
+
+alarm_socket_t alarm_loop_connect(alarm_loop_t loop,
+        unsigned int host,
+        unsigned short port,
+        alarm_socket_connected_cb connected_cb,
+        alarm_socket_read_cb read_cb,
+        alarm_socket_written_cb written_cb,
+        alarm_socket_error_cb error_cb,
+        void* data)
+{
+    struct sockaddr_in server;
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    fcntl(sock, F_SETFL, fcntl(sock, F_GETFL) | O_NONBLOCK | FD_CLOEXEC);
+    server.sin_family = AF_INET;
+    memcpy(&server.sin_addr.s_addr, &host, sizeof (unsigned int));
+    server.sin_port = htons(port);
+    while (1) {
+        if (!connect(sock, (struct sockaddr*)&server, sizeof (server))
+                || errno == EINPROGRESS) {
+            struct AlarmSocket *so = (struct AlarmSocket*)malloc(sizeof (struct AlarmSocket));
+            socket_init(so, connected_cb, NULL, read_cb, written_cb, error_cb, data);
+            so->socket = alarm_loop_add_fd(loop, sock, socket_read, socket_written, NULL, socket_error, so);
+            alarm_fd_write(loop, so->socket, "", 0);
+            return so;
+        }
+        if (errno != EINTR)
+            break;
+    }
+    return NULL;
+}
+
+alarm_socket_t alarm_loop_socket_listen(alarm_loop_t loop,
+        unsigned int net,
+        unsigned short port,
+        alarm_socket_new_connection_cb connection_cb,
+        alarm_socket_read_cb read_cb,
+        alarm_socket_written_cb written_cb,
+        alarm_socket_error_cb error_cb,
+        void* data)
+{
+    struct AlarmSocket *so;
+    struct sockaddr_in server;
+    int opt = 1;
+    int sock;
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    server.sin_family = AF_INET;
+    server.sin_addr.s_addr = INADDR_ANY;
+    server.sin_port = htons (port);
+    setsockopt (sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof (opt));
+    fcntl(sock, F_SETFL, fcntl(sock, F_GETFL) | O_NONBLOCK | FD_CLOEXEC);
+    if (bind (sock, (struct sockaddr*) &server, sizeof (server))) {
+        perror("bind");
+        close(sock);
+        sock = -1;
+        return NULL;
+    }
+    if (listen (sock, 5))
+        perror("listen");
+
+    so = (struct AlarmSocket*)malloc(sizeof (struct AlarmSocket));
+    socket_init(so, NULL, connection_cb, read_cb, written_cb, error_cb, data);
+    so->socket = alarm_loop_add_fd(loop, sock, socket_read, NULL, NULL, NULL, so);
+    FLAG(so->socket, FlagPassiveSocket);
+    return so;
+}
+
+void alarm_socket_write(alarm_loop_t loop, alarm_socket_t so, const char* buffer, const int size)
+{
+    alarm_fd_write(loop, so->socket, buffer, size);
+}
+
+void alarm_socket_destroy(alarm_loop_t loop, alarm_socket_t so)
+{
+    if (so->socket)
+        fd_close(so->socket);
+    free(so);
 }

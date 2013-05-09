@@ -35,6 +35,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <netdb.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -43,10 +44,13 @@ struct Trigger {
     alarm_timer_t extra_on_timer;
     alarm_timer_t max_on_timer;
     alarm_process_t process;
+    alarm_socket_t socket;
     int alarm_fd;
+    unsigned int remote_host;
     int min_off;
     int extra_on;
     int max_on;
+    unsigned short remote_port;
     char alarm;
     char alarm_value;
     char* program;
@@ -67,6 +71,20 @@ static void trigger_process_error(alarm_loop_t loop, alarm_process_t process, vo
     struct Trigger* trigger = (struct Trigger*)data;
     trigger->process = NULL;
     fprintf(stdout, "camera stopped\n");
+}
+
+static void remote_error(alarm_loop_t loop, alarm_socket_t so, void* data)
+{
+    struct Trigger* trigger = (struct Trigger*)data;
+    fprintf(stderr, "remote error %X %s\n", trigger->remote_host, strerror(errno));
+    alarm_socket_destroy(loop, so);
+    trigger->socket = NULL;
+}
+
+static void remote_connected(alarm_loop_t loop, alarm_socket_t so, void* data)
+{
+    struct Trigger* trigger = (struct Trigger*)data;
+    fprintf(stderr, "connected to %X\n", trigger->remote_host);
 }
 
 static void trigger_timeout(alarm_loop_t loop, alarm_timer_t timer, const struct timeval *tv, void* data) {
@@ -102,6 +120,10 @@ static void trigger_timeout(alarm_loop_t loop, alarm_timer_t timer, const struct
 
         fprintf(stdout, "%s stop camera\n", buf);
         alarm_process_signal(loop, trigger->process, SIGINT);
+    }
+    if (trigger->socket) {
+        alarm_socket_destroy(loop, trigger->socket);
+        trigger->socket = NULL;
     }
     if (trigger->alarm_fd > -1) {
         lseek(trigger->alarm_fd, SEEK_SET, 0);
@@ -151,6 +173,13 @@ static void trigger_event(alarm_loop_t loop, alarm_fd_t afd, int fd, void* data)
                     trigger_process_error,
                     data);
         }
+        if (trigger->remote_host && !trigger->socket) {
+            trigger->socket = alarm_loop_connect(loop,
+                    trigger->remote_host, trigger->remote_port,
+                    remote_connected, NULL, NULL, remote_error, trigger);
+            if (!trigger->socket)
+                fprintf(stderr, "failed to connect %X %s\n", trigger->remote_host, strerror(errno));
+        }
     } else {
         if (!trigger->extra_on_timer && trigger->max_on_timer)
             trigger->extra_on_timer = alarm_loop_add_timer(loop, trigger->extra_on, trigger_timeout, data);
@@ -177,7 +206,7 @@ int open_gpio_value(int pin, int flag) {
 static void usage(const char* program, const char* msg) {
     if (msg)
         fprintf(stderr, "%s\n\n", msg);
-    fprintf(stderr, "usage: %s -i input-pin [-alarm 0|1][-o output-pin] [-c camera-app] [-min ms] [-extra ms] [-max ms]\n", program);
+    fprintf(stderr, "usage: %s -i input-pin [-alarm 0|1][-o output-pin] [-c camera-app] [-r host:port] [-min ms] [-extra ms] [-max ms]\n", program);
     exit(1);
 }
 
@@ -222,6 +251,30 @@ int main(int argc, char** argv) {
             if (++i == argc || strlen(argv[i]) > 1 || (argv[i][0] != '0' && argv[i][0] != '1'))
                 usage(argv[0], "option -alarm requires a 0 or 1");
             trigger.alarm = argv[i][0];
+        } else if (!strcmp(argv[i], "-r")) {
+            char *p, *host;
+            struct addrinfo hints, *addrs;
+            int s;
+            if (++i == argc)
+                usage(argv[0], "option -r requires host:port");
+            p = strchr(argv[i], ':');
+            if (!p)
+                usage(argv[0], "option -r requires host:port");
+            host = strndup(argv[i], p-argv[i]);
+            trigger.remote_port = strtol(p+1, NULL, 10);
+            memset(&hints, 0, sizeof(struct addrinfo));
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+
+            s = getaddrinfo(host, NULL, &hints, &addrs);
+            free(host);
+            if (s || !addrs) {
+                fprintf(stderr, "host lookup: %s\n", gai_strerror(s));
+            } else {
+                trigger.remote_host = ((struct sockaddr_in*)addrs->ai_addr)->sin_addr.s_addr;
+                freeaddrinfo(addrs);
+                fprintf(stderr, "host lookup: %X:%d\n", trigger.remote_host, trigger.remote_port);
+            }
         } else if (!strcmp(argv[i], "-c")) {
             if (++i == argc)
                 usage(argv[0], "option -c requires a program name");
