@@ -26,6 +26,7 @@
  */
 
 #include "loop.h"
+#include "util.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -40,42 +41,6 @@
 #include <sys/select.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-
-struct Array
-{
-    int size;
-    int capacity;
-    void **data;
-};
-
-static void array_init(struct Array *array)
-{
-    array->size = array->capacity = 0;
-}
-
-static void array_append(struct Array *array, void *v)
-{
-    if (array->size == array->capacity) {
-        if (!array->size)
-            array->data = (void**)malloc(++array->capacity * sizeof (void*));
-        else
-            array->data = (void**)realloc(array->data, ++array->capacity * sizeof (void*));
-    }
-    array->data[array->size++] = v;
-}
-
-static void array_remove(struct Array *array, int i)
-{
-    if ( i < --array->size )
-        memmove(array->data + i, array->data + i + 1, (array->size - i) * sizeof (void*));
-}
-
-static void array_clear(struct Array *array)
-{
-    if (array->capacity)
-        free(array->data);
-    array->size = array->capacity = 0;
-}
 
 enum AlarmFlags {
     FlagNone=0, FlagRun=1, FlagProcessing=2,
@@ -157,15 +122,15 @@ static void timer_init(struct AlarmTimer* at, int ms, alarm_timer_callback cb, v
 struct AlarmLoop
 {
     struct AlarmLoopAdmin admin;
-    struct Array fds;
-    struct Array timers;
+    struct AlarmArray fds;
+    struct AlarmArray timers;
 };
 
 static void loop_init(struct AlarmLoop *loop)
 {
     init_loop_admin(&loop->admin, FlagNone);
-    array_init(&loop->fds);
-    array_init(&loop->timers);
+    alarm_array_init(&loop->fds);
+    alarm_array_init(&loop->timers);
 }
 
 alarm_loop_t alarm_new_loop()
@@ -194,7 +159,7 @@ alarm_timer_t alarm_loop_add_timer(alarm_loop_t loop, int msec, alarm_timer_call
 {
     struct AlarmTimer* at = (struct AlarmTimer*)malloc(sizeof (struct AlarmTimer));;
     timer_init(at, msec, cb, data);
-    array_append(&loop->timers, at);
+    alarm_array_append(&loop->timers, at);
     return at;
 }
 
@@ -208,7 +173,7 @@ void alarm_loop_remove_timer(alarm_loop_t loop, alarm_timer_t timer)
                 FLAG(t, FlagMarkDelete);
             } else {
                 free(t);
-                array_remove(&loop->timers, i);
+                alarm_array_remove(&loop->timers, i);
             }
             break;
         }
@@ -234,7 +199,7 @@ alarm_fd_t alarm_loop_add_fd(alarm_loop_t loop, int fd,
         }
     }
     fd_init(af, fd, rcb, wcb, ecb, err, data);
-    array_append(&loop->fds, af);
+    alarm_array_append(&loop->fds, af);
     return af;
 }
 
@@ -317,7 +282,7 @@ void alarm_loop_run (alarm_loop_t loop)
                 struct AlarmTimer* timer = (struct AlarmTimer*)loop->timers.data[i];
                 if (TEST(timer, FlagMarkDelete)) {
                     free(timer);
-                    array_remove(&loop->timers, i);
+                    alarm_array_remove(&loop->timers, i);
                 } else {
                     CLEAR(timer, FlagProcessing);
                     ++i;
@@ -342,7 +307,7 @@ void alarm_loop_run (alarm_loop_t loop)
             struct AlarmFileDescriptor *fd = (struct AlarmFileDescriptor*)loop->fds.data[i];
             if (TEST(fd, FlagMarkDelete)) {
                 free(fd);
-                array_remove(&loop->fds, i);
+                alarm_array_remove(&loop->fds, i);
             } else {
 #define ALARM_ADD_TO_SET(fd,set,test)   \
                 if (test) {             \
@@ -420,8 +385,8 @@ void alarm_loop_free(alarm_loop_t loop)
         free(loop->timers.data[i]);
     for (i = 0; i < loop->fds.size; ++i)
         free(loop->fds.data[i]);
-    array_clear(&loop->fds);
-    array_clear(&loop->timers);
+    alarm_array_clear(&loop->fds);
+    alarm_array_clear(&loop->timers);
     free(loop);
 }
 

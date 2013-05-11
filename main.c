@@ -54,6 +54,7 @@ struct Trigger {
     char alarm;
     char alarm_value;
     char* program;
+    char time_update[32];
 };
 
 static void trigger_process_read(alarm_loop_t loop, alarm_process_t process, const char* buffer, int size, void* data)
@@ -85,6 +86,7 @@ static void remote_connected(alarm_loop_t loop, alarm_socket_t so, void* data)
 {
     struct Trigger* trigger = (struct Trigger*)data;
     fprintf(stderr, "connected to %X\n", trigger->remote_host);
+    alarm_socket_write(loop, so, trigger->time_update, strlen(trigger->time_update));
 }
 
 static void trigger_timeout(alarm_loop_t loop, alarm_timer_t timer, const struct timeval *tv, void* data) {
@@ -271,6 +273,15 @@ int main(int argc, char** argv) {
             if (s || !addrs) {
                 fprintf(stderr, "host lookup: %s\n", gai_strerror(s));
             } else {
+                struct timespec uptime;
+                struct timeval now, off, sub;
+                clock_gettime(CLOCK_MONOTONIC, &uptime);
+                off.tv_sec = uptime.tv_sec;
+                off.tv_usec = uptime.tv_nsec/1000;
+                gettimeofday(&now, NULL);
+                timersub(&now, &off, &sub);
+                snprintf(trigger.time_update, sizeof (trigger.time_update), "%lu.%lu\n", sub.tv_sec, sub.tv_usec);
+
                 trigger.remote_host = ((struct sockaddr_in*)addrs->ai_addr)->sin_addr.s_addr;
                 freeaddrinfo(addrs);
                 fprintf(stderr, "host lookup: %X:%d\n", trigger.remote_host, trigger.remote_port);

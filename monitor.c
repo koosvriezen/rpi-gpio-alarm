@@ -26,6 +26,7 @@
  */
 
 #include "loop.h"
+#include "util.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -42,9 +43,8 @@
 static void monitor_timeout(alarm_loop_t loop, alarm_timer_t timer, const struct timeval *tv, void* data);
 
 struct Monitor {
+    struct AlarmArray clients;
     alarm_process_t process;
-    alarm_socket_t socket;
-    unsigned int remote_host;
     unsigned short remote_port;
     int initial_wait;
     int poll_wait;
@@ -52,8 +52,25 @@ struct Monitor {
     char* output_dir;;
 };
 
+static void monitor_init(struct Monitor *monitor)
+{
+    memset(monitor, 0, sizeof (struct Monitor));
+    alarm_array_init(&monitor->clients);
+    monitor->initial_wait = 150;
+    monitor->poll_wait = 100;
+}
+
+static void monitor_clear(struct Monitor *monitor)
+{
+    alarm_array_clear(&monitor->clients);
+}
+
 struct HttpConnection {
     struct Monitor* monitor;
+    alarm_socket_t control_socket;
+    alarm_timer_t connect_back_timer;
+    struct timeval time_offset;
+    unsigned int remote_host;
     int have_headers;
     int found_boundary;
     int read_jpeg;
@@ -67,6 +84,34 @@ struct HttpConnection {
     size_t jpeg_size;
     int failure;
 };
+
+static void http_destroy(struct HttpConnection* http)
+{
+    int i;
+    for (i = 0; i < http->monitor->clients.size; ++i) {
+        if (http == http->monitor->clients.data[i]) {
+            alarm_array_remove(&http->monitor->clients, i);
+            break;
+        }
+    }
+    if (http->buffer)
+        free(http->buffer);
+    if (http->mime_boundary)
+        free(http->mime_boundary);
+    if (http->timestamp)
+        free(http->timestamp);
+    free(http);
+}
+
+static void parse_time(const char *buf, struct timeval *tv)
+{
+    const char *e;
+    tv->tv_sec = strtol(buf, (char**)&e, 10);
+    if (*e)
+        tv->tv_usec = strtol(e+1, NULL, 10);
+    else
+        tv->tv_usec = 0;
+}
 
 static void process_read(alarm_loop_t loop, alarm_process_t process, const char* buffer, int size, void* data)
 {
@@ -151,9 +196,24 @@ static void http_read(alarm_loop_t loop, alarm_socket_t process, const char* buf
                                 http->failure = 1;
                             }
                         } else if (s && !strncmp(http->buffer, "X-Timestamp", 11)) {
-                            if (strlen(v) < 32)
-                                http->timestamp = strdup(v);
-                            else
+                            if (strlen(v) < 32) {
+                                char buf[64], tbuf[64];
+                                unsigned int l = ntohl(http->remote_host);
+                                struct timeval tv, res;
+                                time_t t;
+                                struct tm *tm;
+                                parse_time(v, &tv);
+                                timeradd(&http->time_offset, &tv, &res);
+                                t = res.tv_sec;
+                                tm = localtime(&t);
+                                strftime(tbuf, sizeof (tbuf), "%Y%m%d_%H%M%S", tm);
+                                snprintf(buf, sizeof (buf), "%s_%d.%d.%d.%d", tbuf
+                                        , (l & 0xFF000000) >> 24
+                                        , (l & 0xFF0000) >> 16
+                                        , (l & 0xFF00) >> 8
+                                        , l & 0xFF);
+                                http->timestamp = strdup(buf);
+                            } else
                                 fprintf(stderr, "invalid X-Timestamp\n");
                         } else if (strstr(http->buffer, http->mime_boundary)) {
                             http->jpeg_mime = 0;
@@ -207,48 +267,73 @@ static void http_read(alarm_loop_t loop, alarm_socket_t process, const char* buf
 static void http_error(alarm_loop_t loop, alarm_socket_t so, void* data)
 {
     struct HttpConnection* http = (struct HttpConnection*)data;
-    struct Monitor* monitor = http->monitor;
     fprintf(stdout, "http connect error\n");
     alarm_socket_destroy(loop, so);
-    if (http->buffer)
-        free(http->buffer);
-    if (http->mime_boundary)
-        free(http->mime_boundary);
-    if (http->timestamp)
-        free(http->timestamp);
-    free(http);
-    if (monitor->socket)
-        alarm_loop_add_timer(loop, monitor->poll_wait, monitor_timeout, data);
+    if (http->control_socket) {
+        http->connect_back_timer = alarm_loop_add_timer(loop,
+                http->monitor->poll_wait, monitor_timeout, http);
+    } else {
+        http_destroy(http);
+    }
 }
 
 static void connection_disconnect(alarm_loop_t loop, alarm_socket_t so, void* data)
 {
     struct Monitor* monitor = (struct Monitor*)data;
-    fprintf(stdout, "End of alarm at %X\n", monitor->remote_host);
+    int i;
+    for (i = 0; i < monitor->clients.size; ++i) {
+        struct HttpConnection *conn = (struct HttpConnection*)monitor->clients.data[i];
+        if (conn->control_socket == so) {
+            fprintf(stdout, "End of alarm at %X\n", conn->remote_host);
+            conn->control_socket = NULL;
+            if (conn->connect_back_timer) {
+                fprintf(stderr, "not yet connected\n");
+                alarm_loop_remove_timer(loop, conn->connect_back_timer);
+                http_destroy(conn);
+            }
+            break;
+        }
+    }
     alarm_socket_destroy(loop, so);
-    monitor->socket = NULL;
 }
 
 static void monitor_timeout(alarm_loop_t loop, alarm_timer_t timer, const struct timeval *tv, void* data)
 {
-    struct Monitor* monitor = (struct Monitor*)data;
-    struct HttpConnection *http;
-    http = (struct HttpConnection*)malloc(sizeof (struct HttpConnection));
-    memset(http, 0, sizeof (struct HttpConnection));
-    http->monitor = monitor;
-    http->output_dir = monitor->output_dir ? monitor->output_dir : ".";
+    struct HttpConnection* http = (struct HttpConnection*)data;
+    http->connect_back_timer = NULL;
     alarm_loop_connect(loop,
-            monitor->remote_host, monitor->remote_port,
+            http->remote_host, http->monitor->remote_port,
             http_connected, http_read, NULL, http_error, http);
+}
+
+static void connection_read(alarm_loop_t loop, alarm_socket_t so, const char* buffer, int size, void* data)
+{
+    struct Monitor* monitor = (struct Monitor*)data;
+    int i;
+    for (i = 0; i < monitor->clients.size; ++i) {
+        struct HttpConnection *conn = (struct HttpConnection*)monitor->clients.data[i];
+        if (conn->control_socket == so) {
+            parse_time(buffer, &conn->time_offset);
+            break;
+        }
+    }
 }
 
 static void new_connection(alarm_loop_t loop, alarm_socket_t so, unsigned int remote, void* data)
 {
     struct Monitor* monitor = (struct Monitor*)data;
     fprintf(stdout, "Alarm at %X\n", remote);
-    monitor->remote_host = remote;
-    if (monitor->remote_port)
-        alarm_loop_add_timer(loop, monitor->initial_wait, monitor_timeout, data);
+    if (monitor->remote_port) {
+        struct HttpConnection *http = (struct HttpConnection*)malloc(sizeof (struct HttpConnection));
+        memset(http, 0, sizeof (struct HttpConnection));
+        http->monitor = monitor;
+        http->control_socket = so;
+        http->output_dir = monitor->output_dir ? monitor->output_dir : ".";
+        http->remote_host = remote;
+        http->connect_back_timer = alarm_loop_add_timer(loop,
+                monitor->initial_wait, monitor_timeout, http);
+        alarm_array_append(&monitor->clients, http);
+    }
 }
 
 
@@ -276,9 +361,7 @@ int main(int argc, char** argv)
     int i, port;
     struct Monitor monitor;
 
-    memset(&monitor, 0, sizeof (struct Monitor));
-    monitor.initial_wait = 500;
-    monitor.poll_wait = 200;
+    monitor_init(&monitor);
 
     for (i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-p")) {
@@ -302,13 +385,14 @@ int main(int argc, char** argv)
     loop = alarm_new_loop();
 
     server = alarm_loop_socket_listen(loop, 0, (unsigned short)port,
-            new_connection, NULL, NULL, connection_disconnect, &monitor);
+            new_connection, connection_read, NULL, connection_disconnect, &monitor);
 
     alarm_loop_run(loop);
 
     alarm_socket_destroy(loop, server);
 
     alarm_loop_free(loop);
+    monitor_clear(&monitor);
 
     fprintf(stderr, "Have a nice day!\n");
 
