@@ -207,7 +207,8 @@ static void http_read(alarm_loop_t loop, alarm_socket_t process, const char* buf
                                 t = res.tv_sec;
                                 tm = localtime(&t);
                                 strftime(tbuf, sizeof (tbuf), "%Y%m%d_%H%M%S", tm);
-                                snprintf(buf, sizeof (buf), "%s_%d.%d.%d.%d", tbuf
+                                snprintf(buf, sizeof (buf), "%s.%03d_%d.%d.%d.%d"
+                                        , tbuf, res.tv_usec/1000
                                         , (l & 0xFF000000) >> 24
                                         , (l & 0xFF0000) >> 16
                                         , (l & 0xFF00) >> 8
