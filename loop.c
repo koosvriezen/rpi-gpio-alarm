@@ -45,7 +45,7 @@
 enum AlarmFlags {
     FlagNone=0, FlagRun=1, FlagProcessing=2,
     FlagMarkDelete=4, FlagFdClosed=8,
-    FlagPassiveSocket=16
+    FlagPassiveSocket=16, FlagConnectingSocket=32
 };
 
 struct AlarmLoopAdmin
@@ -317,6 +317,7 @@ void alarm_loop_run (alarm_loop_t loop)
                 }
                 ALARM_ADD_TO_SET(fd->fd, rdset, fd->read_callback)
                 ALARM_ADD_TO_SET(fd->fd, wrset, fd->buffer)
+                ALARM_ADD_TO_SET(fd->fd, wrset, TEST(fd, FlagConnectingSocket))
                 ALARM_ADD_TO_SET(fd->fd, exset, fd->except_callback)
 #undef ALARM_ADD_TO_SET
                 /*fprintf(stderr, " %d", fd->fd);*/
@@ -544,7 +545,6 @@ struct AlarmSocket
 {
     struct AlarmLoopAdmin admin;
     alarm_fd_t socket;
-    int connected;
     alarm_socket_connected_cb connected_callback;
     alarm_socket_new_connection_cb new_connection_callback;
     alarm_socket_read_cb read_callback;
@@ -563,7 +563,6 @@ static void socket_init(struct AlarmSocket* so,
 {
     init_loop_admin(&so->admin, FlagNone);
     so->socket = NULL;
-    so->connected = 0;
     so->connected_callback = ccb;
     so->new_connection_callback = ncb;
     so->read_callback = rcb;
@@ -575,10 +574,10 @@ static void socket_init(struct AlarmSocket* so,
 static void socket_written(alarm_loop_t loop, alarm_fd_t afd, void* data)
 {
     struct AlarmSocket* so = (struct AlarmSocket*)data;
-    if (so->connected_callback && !so->connected) {
+    if (TEST(afd, FlagConnectingSocket)) {
+        CLEAR(afd, FlagConnectingSocket);
         socklen_t len = sizeof (errno);
         if (!getsockopt(afd->fd, SOL_SOCKET, SO_ERROR, &errno, &len) && !errno) {
-            so->connected = 1;
             if (so->connected_callback)
                 so->connected_callback(loop, so, so->data);
         } else {
@@ -642,7 +641,7 @@ alarm_socket_t alarm_loop_connect(alarm_loop_t loop,
             struct AlarmSocket *so = (struct AlarmSocket*)malloc(sizeof (struct AlarmSocket));
             socket_init(so, connected_cb, NULL, read_cb, written_cb, error_cb, data);
             so->socket = alarm_loop_add_fd(loop, sock, socket_read, socket_written, NULL, socket_error, so);
-            alarm_fd_write(loop, so->socket, "", 0);
+            FLAG(so->socket, FlagConnectingSocket);
             return so;
         }
         if (errno != EINTR)
