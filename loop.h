@@ -41,8 +41,8 @@ void alarm_loop_exit(alarm_loop_t loop);
 void alarm_loop_free(alarm_loop_t loop);
 
 typedef struct AlarmTimer* alarm_timer_t;
-typedef void (*alarm_timer_callback)(alarm_loop_t loop, alarm_timer_t timer, const struct timeval *tv, void* data);
-alarm_timer_t alarm_loop_add_timer(alarm_loop_t loop, int msec, alarm_timer_callback callback, void* data);
+typedef void (*alarm_timer_cb)(alarm_loop_t loop, alarm_timer_t timer, const struct timeval *tv, void* data);
+alarm_timer_t alarm_loop_add_timer(alarm_loop_t loop, int msec, alarm_timer_cb callback, void* data);
 void alarm_loop_remove_timer(alarm_loop_t loop, alarm_timer_t timer);
 
 typedef struct AlarmFileDescriptor* alarm_fd_t;

@@ -106,11 +106,11 @@ struct AlarmTimer
     struct AlarmLoopAdmin admin;
     struct timeval tv;
     int msec;
-    alarm_timer_callback callback;
+    alarm_timer_cb callback;
     void* data;
 };
 
-static void timer_init(struct AlarmTimer* at, int ms, alarm_timer_callback cb, void* d)
+static void timer_init(struct AlarmTimer* at, int ms, alarm_timer_cb cb, void* d)
 {
     init_loop_admin(&at->admin, FlagNone);
     at->tv.tv_sec = 0;
@@ -155,7 +155,7 @@ static inline int diff_time (const struct timeval* tv1, const struct timeval* tv
     return (tv1->tv_sec - tv2->tv_sec) * 1000 + (tv1->tv_usec - tv2->tv_usec) /1000;
 }
 
-alarm_timer_t alarm_loop_add_timer(alarm_loop_t loop, int msec, alarm_timer_callback cb, void* data)
+alarm_timer_t alarm_loop_add_timer(alarm_loop_t loop, int msec, alarm_timer_cb cb, void* data)
 {
     struct AlarmTimer* at = (struct AlarmTimer*)malloc(sizeof (struct AlarmTimer));;
     timer_init(at, msec, cb, data);
