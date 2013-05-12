@@ -188,16 +188,7 @@ alarm_fd_t alarm_loop_add_fd(alarm_loop_t loop, int fd,
         void* data)
 {
     struct AlarmFileDescriptor* af = (struct AlarmFileDescriptor*)malloc(sizeof (struct AlarmFileDescriptor));
-    while (fcntl(fd, F_SETFD, fcntl(fd , F_GETFL) | O_NONBLOCK | FD_CLOEXEC) < 0) {
-        switch (errno) {
-        case EAGAIN:
-        case EINTR:
-            break;
-        default:
-            fprintf(stderr, "fcntl %s\n", strerror(errno));
-            return NULL;
-        }
-    }
+    fcntl(fd, F_SETFD, fcntl(fd , F_GETFL) | O_NONBLOCK | FD_CLOEXEC);
     fd_init(af, fd, rcb, wcb, ecb, err, data);
     alarm_array_append(&loop->fds, af);
     return af;
