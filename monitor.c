@@ -237,8 +237,14 @@ static void http_read(alarm_loop_t loop, alarm_socket_t process, const char* buf
                 break;
             default:
                 if (http->buf_pos + 1 >= http->buf_size) {
-                    http->buf_size = http->buf_size * 1.4;
-                    http->buffer = (char*)realloc(http->buffer, http->buf_size);
+                    int new_size = http->buf_size * 1.4;
+                    if (new_size > 1024*1024) {
+                        fprintf(stderr, "header size to large: %d\n", new_size);
+                        http->failure = 1;
+                        break;
+                    }
+                    http->buf_size = new_size;
+                    http->buffer = (char*)realloc(http->buffer, new_size);
                 }
                 http->buffer[http->buf_pos++] = buffer[i];
                 break;
