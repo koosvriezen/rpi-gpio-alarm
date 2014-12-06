@@ -164,10 +164,15 @@ static void http_read(alarm_loop_t loop, alarm_socket_t process, const char* buf
                     } else {
                         if (!http->found_boundary)
                             break;
-                        http->read_jpeg = 1;
-                        if (http->jpeg_size > http->buf_size) {
-                            http->buf_size = http->jpeg_size;
-                            http->buffer = (char*)realloc(http->buffer, http->buf_size);
+                        if (http->jpeg_size == 0) {
+                            http->buf_pos = 0;
+                            http->found_boundary = 0;
+                        } else {
+                            http->read_jpeg = 1;
+                            if (http->jpeg_size > http->buf_size) {
+                                http->buf_size = http->jpeg_size;
+                                http->buffer = (char*)realloc(http->buffer, http->buf_size);
+                            }
                         }
                     }
                 } else {
