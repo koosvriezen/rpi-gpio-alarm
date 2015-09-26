@@ -4,10 +4,10 @@ MONITOR_OBJECTS=monitor.o loop.o util.o
 all: alarm monitor
 
 alarm: $(MAIN_OBJECTS)
-	gcc -s -o $@ $^ -lrt
+	gcc -s -o $@ $^ -lrt -lm
 
 monitor: $(MONITOR_OBJECTS)
-	gcc -s -o $@ $^
+	gcc -s -o $@ $^ -lm
 
 %.o: %.c
 	gcc -c -O2 -Wall $< -o $@

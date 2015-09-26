@@ -44,6 +44,9 @@ void alarm_array_append(struct AlarmArray *array, void *v);
 void alarm_array_remove(struct AlarmArray *array, int i);
 void alarm_array_clear(struct AlarmArray *array);
 
+struct tm;
+void sunrise_sunset(const struct tm* lt, int *sethour, int *setminute, int *risehour, int *riseminute);
+
 #ifdef __cplusplus
 }
 #endif

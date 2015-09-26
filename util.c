@@ -29,6 +29,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <math.h>
 
 void alarm_array_init(struct AlarmArray *array)
 {
@@ -57,4 +59,60 @@ void alarm_array_clear(struct AlarmArray *array)
     if (array->capacity)
         free(array->data);
     array->size = array->capacity = 0;
+}
+
+/* based on http://williams.best.vwh.net/sunrise_sunset_algorithm.htm */
+/* TODO make this configurable */
+#define longitude       (0.00000)
+#define latitude        (0.0000)
+
+double norm(double high, double d) {
+    while (d < 0)
+        d += high;
+    while (d > high)
+        d -= high;
+    return d;
+}
+
+static void rise_set(const struct tm* lt, int rise, int *hour, int *minute) {
+    const double zenith = 90 + 50./60;
+    double N, N1, N2, N3, lngHour, t, M, L, RA, Lquadrant, RAquadrant, sinDec, cosDec, cosH, H, T, UT;
+
+    N1 = floor(275 * (lt->tm_mon +1) / 9);
+    N2 = floor(((lt->tm_mon +1) + 9) / 12);
+    N3 = (1 + floor(((lt->tm_year+1900) - 4 * floor((lt->tm_year+1900) / 4) + 2) / 3));
+    N = N1 - (N2 * N3) + lt->tm_mday - 30;
+    lngHour = longitude / 15;
+    if (rise)
+        t = N + ((6 - lngHour) / 24); /*rising*/
+    else
+        t = N + ((18 - lngHour) / 24); /*setting*/
+    M = (0.9856 * t) - 3.289;
+    L = norm(360, M + (1.916 * sin(M*M_PI/180)) + (0.020 * sin(2 * M*M_PI/180)) + 282.634);
+    RA = norm(360, atan(0.91764 * tan(L*M_PI/180))*180/M_PI);
+    Lquadrant  = floor( L/90) * 90;
+    RAquadrant = floor(RA/90) * 90;
+    RA = RA + (Lquadrant - RAquadrant);
+    RA = RA / 15;
+    sinDec = 0.39782 * sin(L*M_PI/180);
+    cosDec = cos(asin(sinDec));
+    cosH = (cos(zenith*M_PI/180) - (sinDec * sin(latitude*M_PI/180))) / (cosDec * cos(latitude*M_PI/180));
+    if (cosH > 1)
+        return;
+    if (cosH < -1)
+        return;
+    if (rise)
+        H = 360 - acos(cosH)*180/M_PI; /*rising*/
+    else
+        H =       acos(cosH)*180/M_PI; /*setting*/
+    H = H / 15;
+    T = H + RA - (0.06571 * t) - 6.622;
+    UT = norm(24, T - lngHour);
+    *hour = lt->tm_gmtoff/3600 + (int)UT;
+    *minute = (int)((UT-(int)UT)*60);
+}
+
+void sunrise_sunset(const struct tm* lt, int *sethour, int *setminute, int *risehour, int *riseminute) {
+    rise_set(lt, 1, risehour, riseminute);
+    rise_set(lt, 0, sethour, setminute);
 }
