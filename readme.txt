@@ -30,6 +30,9 @@ Also when -hue is given for Philips Hue systems, the give light is turned on.
 These lights can be indepent timed when adding the extra parameter. But
 note, the lights are then switched on *only* depending on the sun. You
 must changed the latitude/longitude values in utils.c to match your location.
+When 'hue-hub-ip' is equal to the string 'ssdp', then alarm will listen to
+Simple Service Discovery Protocol messages to figure out the ip of the hue
+bridge. May take a while before the IP is found.
 
 To setup the GPIO's run the following as root (e.g. add it to rc.local),
 the alarm program can run as normal user.

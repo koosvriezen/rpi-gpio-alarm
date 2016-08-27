@@ -30,6 +30,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +59,7 @@ struct SensorIn {
 struct HueLights {
     struct Program program;
     struct SensorIn *sensor;
+    alarm_socket_t ssdp;
     alarm_socket_t socket;
     alarm_timer_t on_timer;
     alarm_timer_t test_off_timer;
@@ -366,6 +368,19 @@ static void lights_run(alarm_loop_t loop, void* data) {
     }
 }
 
+static void ssdp_recv(alarm_loop_t loop, alarm_socket_t so, unsigned int remote, const char* buffer, int size, void* data)
+{
+    struct HueLights* lights = (struct HueLights*)data;
+    if (strstr(buffer, "hue-bridgeid")) {
+        /*fprintf(stderr, "ssdp_read from %x %s\n", remote, buffer);*/
+        if (lights->remote_host != remote) {
+            lights->remote_host = remote;
+            fprintf(stderr, "Updating Hue hub at %08X with username %s and light %d with time %d\n",
+                    lights->remote_host, lights->username, lights->light, lights->extra_on);
+        }
+    }
+}
+
 static void sensor_event(alarm_loop_t loop, alarm_fd_t afd, int fd, void* data) {
     struct SensorIn* sensor = (struct SensorIn*)data;
     int count, i;
@@ -424,9 +439,12 @@ static int hue_init(struct HueLights *lights, /*const*/ char* config) {
     char *str = strtok(config, ":");
     if (!str)
         return -1;
-    lights->remote_host = ip4addr(str);
-    if (!lights->remote_host)
-        return -2;
+    lights->remote_host = 0;
+    if (strcmp(str, "ssdp")) {
+        lights->remote_host = ip4addr(str);
+        if (!lights->remote_host)
+            return -2;
+    }
     str = strtok(NULL, ":");
     if (!str)
         return -3;
@@ -550,13 +568,38 @@ int main(int argc, char** argv) {
 
     alarm_array_init(&programs);
     alarm_array_append(&programs, &trigger);
-    if (lights.remote_host) {
+
+    loop = alarm_new_loop();
+
+    if (lights.username) {
+        struct ifaddrs *local;
+        if (!lights.remote_host) {
+            if (!getifaddrs(&local)) {
+                struct ifaddrs *ifptr;
+
+                for (ifptr = local; ifptr; ifptr = ifptr->ifa_next) {
+                    if (ifptr->ifa_addr
+                            && ifptr->ifa_addr->sa_family == AF_INET
+                            && !strcmp(ifptr->ifa_name, "eth0") ) {
+                        struct in_addr local_if = ((struct sockaddr_in*)ifptr->ifa_addr)->sin_addr;
+                        lights.ssdp = alarm_loop_socket_datagram(loop,
+                                local_if.s_addr, ip4addr("239.255.255.250"), 1900,
+                                ssdp_recv, NULL, NULL, &lights);
+                        break;
+                    }
+                }
+                freeifaddrs(local);
+                if (!lights.ssdp)
+                    fprintf(stderr, "ssdp: failed to get eth0 IP");
+            } else {
+                perror("getifaddrs");
+            }
+        }
         if (!lights.extra_on)
             trigger.lights = &lights;
         alarm_array_append(&programs, &lights);
     }
 
-    loop = alarm_new_loop();
     alarm_loop_add_fd(loop, sensor.pin_fd, NULL, NULL, sensor_event, trigger_error, &sensor);
     alarm_loop_run(loop);
     alarm_loop_free(loop);
