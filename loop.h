@@ -77,6 +77,7 @@ typedef struct AlarmSocket* alarm_socket_t;
 typedef void (*alarm_socket_connected_cb)(alarm_loop_t loop, alarm_socket_t so, void* data);
 typedef void (*alarm_socket_new_connection_cb)(alarm_loop_t loop, alarm_socket_t so, unsigned int remote_host, void* data);
 typedef void (*alarm_socket_read_cb)(alarm_loop_t loop, alarm_socket_t so, const char* buffer, int size, void* data);
+typedef void (*alarm_socket_recv_cb)(alarm_loop_t loop, alarm_socket_t so, unsigned int remote_host, const char* buffer, int size, void* data);
 typedef void (*alarm_socket_written_cb)(alarm_loop_t loop, alarm_socket_t so, void* data);
 typedef void (*alarm_socket_error_cb)(alarm_loop_t loop, alarm_socket_t so, void* data);
 alarm_socket_t alarm_loop_connect(alarm_loop_t loop,
@@ -92,6 +93,14 @@ alarm_socket_t alarm_loop_socket_listen(alarm_loop_t loop,
         unsigned short port,
         alarm_socket_new_connection_cb connected_cb,
         alarm_socket_read_cb read_cb,
+        alarm_socket_written_cb written_cb,
+        alarm_socket_error_cb error_cb,
+        void* data);
+alarm_socket_t alarm_loop_socket_datagram(alarm_loop_t loop,
+        unsigned int bind_addr,
+        unsigned int mcast_addr,
+        unsigned short port,
+        alarm_socket_recv_cb recv_cb,
         alarm_socket_written_cb written_cb,
         alarm_socket_error_cb error_cb,
         void* data);

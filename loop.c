@@ -539,6 +539,7 @@ struct AlarmSocket
     alarm_socket_connected_cb connected_callback;
     alarm_socket_new_connection_cb new_connection_callback;
     alarm_socket_read_cb read_callback;
+    alarm_socket_recv_cb recv_callback;
     alarm_socket_written_cb written_callback;
     alarm_socket_error_cb error_callback;
     void* data;
@@ -548,6 +549,7 @@ static void socket_init(struct AlarmSocket* so,
         alarm_socket_connected_cb ccb,
         alarm_socket_new_connection_cb ncb,
         alarm_socket_read_cb rcb,
+        alarm_socket_recv_cb rvcb,
         alarm_socket_written_cb wcb,
         alarm_socket_error_cb err,
         void* d)
@@ -557,6 +559,7 @@ static void socket_init(struct AlarmSocket* so,
     so->connected_callback = ccb;
     so->new_connection_callback = ncb;
     so->read_callback = rcb;
+    so->recv_callback = rvcb;
     so->written_callback = wcb;
     so->error_callback = err;
     so->data = d;
@@ -600,7 +603,7 @@ static void socket_read(alarm_loop_t loop, alarm_fd_t afd, const char* buffer, i
         if (fd > 0) {
             fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK | FD_CLOEXEC);
             struct AlarmSocket *client = (struct AlarmSocket*)malloc(sizeof (struct AlarmSocket));
-            socket_init(client, NULL, NULL, so->read_callback, so->written_callback, so->error_callback, so->data);
+            socket_init(client, NULL, NULL, so->read_callback, NULL, so->written_callback, so->error_callback, so->data);
             client->socket = alarm_loop_add_fd(loop, fd, socket_read, socket_written, NULL, socket_error, client);
             so->new_connection_callback(loop, client, from.sin_addr.s_addr, client->data);
         } else {
@@ -608,6 +611,22 @@ static void socket_read(alarm_loop_t loop, alarm_fd_t afd, const char* buffer, i
         }
     } else if (so->read_callback) {
         so->read_callback(loop, so, buffer, size, so->data);
+    }
+}
+
+static void socket_recv(alarm_loop_t loop, alarm_fd_t afd, const char* buffer, int size, void* data)
+{
+    struct AlarmSocket* so = (struct AlarmSocket*)data;
+    char buf[1024];
+    struct sockaddr_in from_addr;
+    socklen_t addrlen = sizeof(from_addr);
+    size = recvfrom(so->socket->fd, buf, sizeof (buf)-1, 0, (struct sockaddr *)&from_addr, &addrlen);
+    if (size > 0) {
+        buf[size] = 0;
+        so->recv_callback(loop, so, from_addr.sin_addr.s_addr, buf, size, so->data);
+    } else if (size == 0 || !(EAGAIN == errno || EINTR == errno)) {
+        fd_close(afd);
+        socket_error(loop, afd, data);
     }
 }
 
@@ -630,7 +649,7 @@ alarm_socket_t alarm_loop_connect(alarm_loop_t loop,
         if (!connect(sock, (struct sockaddr*)&server, sizeof (server))
                 || errno == EINPROGRESS) {
             struct AlarmSocket *so = (struct AlarmSocket*)malloc(sizeof (struct AlarmSocket));
-            socket_init(so, connected_cb, NULL, read_cb, written_cb, error_cb, data);
+            socket_init(so, connected_cb, NULL, read_cb, NULL, written_cb, error_cb, data);
             so->socket = alarm_loop_add_fd(loop, sock, socket_read, socket_written, NULL, socket_error, so);
             FLAG(so->socket, FlagConnectingSocket);
             return so;
@@ -670,8 +689,54 @@ alarm_socket_t alarm_loop_socket_listen(alarm_loop_t loop,
         perror("listen");
 
     so = (struct AlarmSocket*)malloc(sizeof (struct AlarmSocket));
-    socket_init(so, NULL, connection_cb, read_cb, written_cb, error_cb, data);
+    socket_init(so, NULL, connection_cb, read_cb, NULL, written_cb, error_cb, data);
     so->socket = alarm_loop_add_fd(loop, sock, socket_read, NULL, NULL, NULL, so);
+    FLAG(so->socket, FlagPassiveSocket);
+    return so;
+}
+
+alarm_socket_t alarm_loop_socket_datagram(alarm_loop_t loop,
+        unsigned int bind_addr,
+        unsigned int mcast_addr,
+        unsigned short port,
+        alarm_socket_recv_cb recv_cb,
+        alarm_socket_written_cb written_cb,
+        alarm_socket_error_cb error_cb,
+        void* data)
+{
+    struct AlarmSocket *so;
+    struct sockaddr_in server;
+    int opt = 1;
+    int sock;
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    server.sin_family = AF_INET;
+    server.sin_addr.s_addr = htonl(INADDR_ANY);
+    server.sin_port = htons(port);
+    setsockopt (sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof (opt));
+    fcntl(sock, F_SETFL, fcntl(sock, F_GETFL) | O_NONBLOCK | FD_CLOEXEC);
+    if (bind (sock, (struct sockaddr*) &server, sizeof (server))) {
+        perror("bind");
+        close(sock);
+        return NULL;
+    }
+    if (mcast_addr) {
+        struct ip_mreq group;
+        group.imr_interface.s_addr = bind_addr;
+        group.imr_multiaddr.s_addr = mcast_addr;
+        if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF, (char*)&group.imr_interface.s_addr, sizeof(struct in_addr))) {
+            perror("setsockopt IP_MULTICAST_IF");
+            close(sock);
+            return NULL;
+        }
+        if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&group, sizeof(group))) {
+            perror("setsockopt IP_ADD_MEMBERSHIP");
+            close(sock);
+            return NULL;
+        }
+    }
+    so = (struct AlarmSocket*)malloc(sizeof (struct AlarmSocket));
+    socket_init(so, NULL, NULL, NULL, recv_cb, written_cb, error_cb, data);
+    so->socket = alarm_loop_add_fd(loop, sock, socket_recv, socket_written, NULL, socket_error, so);
     FLAG(so->socket, FlagPassiveSocket);
     return so;
 }
