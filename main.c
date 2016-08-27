@@ -60,11 +60,13 @@ struct HueLights {
     struct SensorIn *sensor;
     alarm_socket_t socket;
     alarm_timer_t on_timer;
+    alarm_timer_t test_off_timer;
     unsigned int remote_host;
     int light;
     int extra_on;
     char *username;
     char on;
+    char read_header;
 };
 
 struct Trigger {
@@ -170,6 +172,32 @@ static void trigger_timeout(alarm_loop_t loop, alarm_timer_t timer, const struct
         switch_lights(loop, trigger->lights, 0);
 }
 
+static void turn_on(alarm_loop_t loop, struct Trigger* trigger) {
+    if (trigger->relay_fd > -1) {
+        lseek(trigger->relay_fd, SEEK_SET, 0);
+        write(trigger->relay_fd, "1", 1);
+    }
+    if (trigger->command && !trigger->process) {
+        fprintf(stdout, "start %s\n", trigger->command);
+        trigger->process = alarm_loop_process_start(loop,
+                trigger->command,
+                trigger_process_read,
+                NULL,
+                trigger_process_written,
+                trigger_process_error,
+                trigger);
+    }
+    if (trigger->remote_host && !trigger->socket) {
+        trigger->socket = alarm_loop_connect(loop,
+                trigger->remote_host, trigger->remote_port,
+                remote_connected, NULL, NULL, remote_error, trigger);
+        if (!trigger->socket)
+            fprintf(stderr, "failed to connect %X %s\n", trigger->remote_host, strerror(errno));
+    }
+    if (trigger->lights && !trigger->lights->on)
+        switch_lights(loop, trigger->lights, 1);
+}
+
 static void trigger_run(alarm_loop_t loop, void* data) {
     struct Trigger* trigger = (struct Trigger*)data;
 
@@ -181,29 +209,7 @@ static void trigger_run(alarm_loop_t loop, void* data) {
         if (trigger->min_off_timer || trigger->max_on_timer)
             return;
         trigger->max_on_timer = alarm_loop_add_timer(loop, trigger->max_on, trigger_timeout, data);
-        if (trigger->relay_fd > -1) {
-            lseek(trigger->relay_fd, SEEK_SET, 0);
-            write(trigger->relay_fd, "1", 1);
-        }
-        if (trigger->command && !trigger->process) {
-            fprintf(stdout, "start %s\n", trigger->command);
-            trigger->process = alarm_loop_process_start(loop,
-                    trigger->command,
-                    trigger_process_read,
-                    NULL,
-                    trigger_process_written,
-                    trigger_process_error,
-                    data);
-        }
-        if (trigger->remote_host && !trigger->socket) {
-            trigger->socket = alarm_loop_connect(loop,
-                    trigger->remote_host, trigger->remote_port,
-                    remote_connected, NULL, NULL, remote_error, trigger);
-            if (!trigger->socket)
-                fprintf(stderr, "failed to connect %X %s\n", trigger->remote_host, strerror(errno));
-        }
-        if (trigger->lights && !trigger->lights->on)
-            switch_lights(loop, trigger->lights, 1);
+        turn_on(loop, trigger);
     } else {
         if (!trigger->extra_on_timer && trigger->max_on_timer)
             trigger->extra_on_timer = alarm_loop_add_timer(loop, trigger->extra_on, trigger_timeout, data);
@@ -213,7 +219,8 @@ static void trigger_run(alarm_loop_t loop, void* data) {
 static void hue_error(alarm_loop_t loop, alarm_socket_t so, void* data)
 {
     struct HueLights* lights = (struct HueLights*)data;
-    fprintf(stderr, "hue_remote error %X %s\n", lights->remote_host, strerror(errno));
+    if (errno)
+        fprintf(stderr, "hue_remote error %X %s\n", lights->remote_host, strerror(errno));
     alarm_socket_destroy(loop, so);
     lights->socket = NULL;
 }
@@ -221,12 +228,36 @@ static void hue_error(alarm_loop_t loop, alarm_socket_t so, void* data)
 static void hue_read(alarm_loop_t loop, alarm_socket_t so, const char* buffer, int size, void* data)
 {
     struct HueLights* lights = (struct HueLights*)data;
+    if (!lights->read_header) {
+        const char* p = strstr(buffer, "\r\n\r\n");
+        if (!p)
+            return;
+        lights->read_header = 1;
+        if (p - buffer <= size - 4)
+            return;
+        buffer = p;
+    }
     fprintf(stderr, "hue_remote read: %s\n", buffer);
     alarm_socket_destroy(loop, so);
     lights->socket = NULL;
 }
 
-static void hue_connected(alarm_loop_t loop, alarm_socket_t so, void* data)
+static void hue_read_get(alarm_loop_t loop, alarm_socket_t so, const char* buffer, int size, void* data)
+{
+    struct HueLights* lights = (struct HueLights*)data;
+    if (strstr(buffer, "\"on\":false")) {
+        fprintf(stderr, "hue_remote_get read: off (%s)\n", buffer);
+        alarm_socket_destroy(loop, so);
+        lights->socket = NULL;
+    } else if (strstr(buffer, "\"on\":true")) {
+        fprintf(stderr, "hue_remote_get read: on (%s)\n", buffer);
+        alarm_socket_destroy(loop, so);
+        lights->socket = NULL;
+        switch_lights(loop, lights, 0);
+    }
+}
+
+static void hue_connected_set(alarm_loop_t loop, alarm_socket_t so, void* data)
 {
     struct HueLights* lights = (struct HueLights*)data;
     const char* tmpl = "PUT /api/%s/lights/%d/state HTTP/1.1\r\n"
@@ -242,28 +273,65 @@ static void hue_connected(alarm_loop_t loop, alarm_socket_t so, void* data)
     else
         snprintf(buf, sizeof (buf), tmpl, lights->username, lights->light, 12, "false");
     fprintf(stderr, "hue_connected to %X\n", lights->remote_host);
+    lights->read_header = 0;
     alarm_socket_write(loop, so, buf, strlen(buf));
 }
 
-static void switch_lights(alarm_loop_t loop, struct HueLights *lights, int on) {
-    fprintf(stderr, "Turn light %s\n", on ? "on" : "off");
-    lights->on = on;
-    lights->socket = alarm_loop_connect(loop,
-            lights->remote_host, 80,
-            hue_connected, hue_read, NULL, hue_error, lights);
-    if (!lights->socket)
-        fprintf(stderr, "Hue failed to connect %s\n", strerror(errno));
+static void hue_connected_get(alarm_loop_t loop, alarm_socket_t so, void* data)
+{
+    struct HueLights* lights = (struct HueLights*)data;
+    const char* tmpl = "GET /api/%s/lights/%d HTTP/1.1\r\n"
+        "User-Agent: alarm\r\n"
+        "Accept: */*\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    char buf[256];
+    snprintf(buf, sizeof (buf), tmpl, lights->username, lights->light);
+    fprintf(stderr, "hue_connected_get to %X\n", lights->remote_host);
+    lights->read_header = 0;
+    alarm_socket_write(loop, so, buf, strlen(buf));
 }
 
 static void lights_timeout(alarm_loop_t loop, alarm_timer_t timer, const struct timeval *tv, void* data) {
     struct HueLights* lights = (struct HueLights*)data;
     (void)tv;
-    (void)timer;
-    if (lights->on) {
-        switch_lights(loop, lights, 0);
-    } else {
-        fprintf(stderr, "Err time-out lights already off\n");
+    if (timer == lights->on_timer) {
+        lights->on_timer = NULL;
+        if (lights->on) {
+            switch_lights(loop, lights, 0);
+        } else {
+            fprintf(stderr, "Err time-out lights already off\n");
+        }
+    } else if (timer == lights->test_off_timer) {
+        lights->test_off_timer = NULL;
+        if (lights->socket)
+            alarm_socket_destroy(loop, lights->socket);
+        lights->socket = alarm_loop_connect(loop,
+                lights->remote_host, 80,
+                hue_connected_get, hue_read_get, NULL, hue_error, lights);
     }
+}
+
+static void switch_lights(alarm_loop_t loop, struct HueLights *lights, int on) {
+    fprintf(stderr, "Turn light %s\n", on ? "on" : "off");
+    if (!lights->remote_host) {
+        fprintf(stderr, "hue-bridge IP not received\n");
+        return;
+    }
+    if (lights->test_off_timer) {
+        alarm_loop_remove_timer(loop, lights->test_off_timer);
+        lights->test_off_timer = NULL;
+    }
+    lights->on = on;
+    if (lights->socket)
+        alarm_socket_destroy(loop, lights->socket);
+    lights->socket = alarm_loop_connect(loop,
+            lights->remote_host, 80,
+            hue_connected_set, hue_read, NULL, hue_error, lights);
+    if (!lights->socket)
+        fprintf(stderr, "Hue failed to connect %s\n", strerror(errno));
+    if ( !on)
+        lights->test_off_timer = alarm_loop_add_timer(loop, 5000, lights_timeout, lights);
 }
 
 static void lights_run(alarm_loop_t loop, void* data) {
